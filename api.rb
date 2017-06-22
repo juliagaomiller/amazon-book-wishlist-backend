@@ -1,40 +1,62 @@
 require 'sinatra'
 require 'sinatra/cross_origin'
+require "sinatra/activerecord"
+
 require 'nokogiri'
 gem 'http'
 require 'http'
 
 require 'sqlite3'
 
-
-if !File.exists?("books.db")
-  $db = SQLite3::Database.new "books.db"
+class Book < ActiveRecord::Base
+  has_and_belongs_to_many :authors
+  has_and_belongs_to_many :tags
   
-  # Create a table
-  rows = $db.execute("
-    create table books (
-      id integer primary key autoincrement,
-      title varchar(255),
-      reviewCount integer,
-      averageRating varchar(10),
-      authors varchar(255),
-      bookUrl varachar(255),
-      bookCoverImage varachar(255),
-      tags varachar(255),
-      notes text
-    );
-  ");
-  puts rows.inspect
-else
-  $db = SQLite3::Database.new "books.db"
-end  
+  def api_hash
+    return {
+      id: self.id,
+      title: self.title,
+      averageRating: self.average_rating,
+      reviewCount: self.review_count,
+      bookUrl: self.book_url,
+      bookCoverImage: self.book_cover_image,
+      notes: self.notes,
+      tags: self.tags.collect { |t| t.api_hash },
+      authors: self.authors.collect { |a| a.api_hash }
+    }  
+  end
+end
 
-$db.results_as_hash = true
+class Author < ActiveRecord::Base
+  has_and_belongs_to_many :books
+  
+  def api_hash
+    return {
+      id: id,
+      name: name
+    }
+  end
+end
+
+class Tag < ActiveRecord::Base
+  has_and_belongs_to_many :books
+
+  def api_hash
+    return {
+      id: id,
+      name: name,
+      bookCount: books.count
+    }
+  end
+end
 
 
 
 class JuliaAPI < Sinatra::Base
   register Sinatra::CrossOrigin
+  register Sinatra::ActiveRecordExtension
+
+  set :database, {adapter: "sqlite3", database: "books.sqlite3"}
 
   configure do
     enable :cross_origin
@@ -59,21 +81,72 @@ class JuliaAPI < Sinatra::Base
     
     p = params
     
-    $db.execute("INSERT INTO books (title, reviewCount, averageRating, authors, bookUrl, bookCoverImage, tags, notes) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [p[:title], p[:reviewCount], p[:averageRating], p[:authors], p[:bookUrl], p[:bookCoverImage], p[:tags], p[:notes]])
-
-
-    #File.open('books.db', 'a') do |f|
-    #  f.puts(book_data)
-    #end
-# 		content_type :json
-# 		
-# 		return book_data
+    book_authors = []
+    
+    authors = params[:authors]
+    
+    unless authors.nil?
+      authors = authors.strip.split(/,[ ]+/)
+      
+      authors.each do |name|
+        existing = Author.where(name: name)
+        if existing.empty?
+          a = Author.new
+          a.name = name
+          a.save
+          book_authors << a
+        else
+          book_authors << existing.first
+        end
+      end
+    end
+    
+    
+    book_tags = []
+    
+    tags = params[:tags]
+    
+    unless tags.nil?
+      tags = tags.strip.split(/,[ ]+/)
+      
+      tags.each do |name|
+        existing = Tag.where(name: name)
+        if existing.empty?
+          t = Tag.new
+          t.name = name
+          t.save
+          
+          book_tags << t
+        else
+          book_tags << existing[0]
+        end
+      end
+    end
+    
+        
+    
+    b = Book.new
+    b.title = p[:title]
+    b.review_count = p[:reviewCount]
+    b.average_rating = p[:averageRating].to_f
+    b.book_url = p[:bookUrl]
+    b.book_cover_image = p[:bookCoverImage]
+    b.notes = p[:notes]
+    b.authors = book_authors
+    b.tags = book_tags
+    b.save
+    
 		redirect "http://julia.rogue.is/amazon-book-wishlist"
 	end
 	
+  get '/tags' do
+    content_type :json
+    Tag.all.collect { |t| t.api_hash }.sort_by { |t| t[:bookCount] }.to_json
+  end
+
 	get '/books' do
 	  books = []
+
 	  if params[:sortBy] 
 		  sort_by = params[:sortBy]
 		else 
@@ -90,15 +163,24 @@ class JuliaAPI < Sinatra::Base
 	  #  books << JSON::parse(line)
 	  #end
 	  if params[:q]
-  	  $db.execute( "select * from books where title like '%" + params[:q] + "%'") do |row|
-        row.keys.each { |key| row.delete(key) if key.kind_of?(Fixnum) }
-  
-        books << row
+#   	  $db.execute( "select * from books where title like '%" + params[:q] + "%'") do |row|
+#         row.keys.each { |key| row.delete(key) if key.kind_of?(Fixnum) }
+#   
+#         books << row
+#       end
+    elsif params[:tag]
+      t = Tag.find_by_name(params[:tag])
+      if t.nil?
+        return [].to_json
+      else
+        t.books.each do |b|
+          books << b.api_hash
+        end
       end
+      
     else
-  	  $db.execute( "select * from books order by #{sort_by} #{direction}" ) do |row|
-        row.keys.each { |key| row.delete(key) if key.kind_of?(Fixnum) }
-        books << row
+      Book.all.each do |b|
+        books << b.api_hash
       end
     end
 		content_type :json
@@ -107,7 +189,8 @@ class JuliaAPI < Sinatra::Base
   
   post '/books/delete' do
 	  if params[:id]
-		  $db.execute("delete from books where id = ?", params[:id])
+		  b = Book.find_by_id(params[:id])
+		  b.destroy unless b.nil?
 		end
 		return
 	end
@@ -141,6 +224,8 @@ class JuliaAPI < Sinatra::Base
 	  if title.nil?
 		  title = ebook_title_re.match(body)
 		end
+		
+		puts "TITLE: #{title.inspect}"
 
 	  if title.nil?
 			data['error'] = "Could not find title"		  
@@ -206,7 +291,14 @@ class JuliaAPI < Sinatra::Base
     # fiveStarPercentage = doc.css("td a.histogram-review-count[class~='5star']").first.content.sub("%","").to_f/100
     # data[:fiveStarPercentage] = fiveStarPercentage.empty? ? "None" : fiveStarPercentage.first.content.sub("%","").to_f/100
 		
-		data[:bookCoverImage] = doc.css("img.frontImage").first.attribute("src")
+		front_image = doc.css("img.frontImage")
+		
+		#puts front_image.inspect
+		#puts front_image.first.inspect
+		img_data = JSON::parse(front_image.first.attribute("data-a-dynamic-image"))
+		
+		
+		data[:bookCoverImage] = img_data.keys.first
 		
 # 		data[:authorImage] = doc.css("div.authorImageBlock img").first.attribute("src")
 # 		puts "===COMMENT===AUTHOR IMG = #{data[:authorImage]}"
